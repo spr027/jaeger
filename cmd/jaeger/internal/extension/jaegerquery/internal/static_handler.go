@@ -5,18 +5,23 @@
 package app
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/spf13/afero"
 	"go.uber.org/zap"
 
 	"github.com/jaegertracing/jaeger/cmd/jaeger/internal/extension/jaegerquery/internal/ui"
@@ -97,6 +102,8 @@ type loadedConfig struct {
 	config []byte
 }
 
+const jaegerUIArchivePrefix = "packages/jaeger-ui/build"
+
 func newStaticAssetsHandler(
 	qOpts *QueryOptions,
 	backendCaps BackendCapabilityProvider,
@@ -104,7 +111,11 @@ func newStaticAssetsHandler(
 ) (*staticAssetsHandler, error) {
 	assetsFS := ui.GetStaticFiles(logger)
 	if qOpts.UIConfig.AssetsPath != "" {
-		assetsFS = http.Dir(qOpts.UIConfig.AssetsPath)
+		fsys, err := newAssetsFS(qOpts.UIConfig.AssetsPath)
+		if err != nil {
+			return nil, err
+		}
+		assetsFS = fsys
 	}
 	raw, err := loadIndexHTML(assetsFS.Open)
 	if err != nil {
@@ -132,6 +143,88 @@ func newStaticAssetsHandler(
 		logger.Info("Using UI configuration", zap.String("path", h.uiConfigFile))
 	}
 	return h, nil
+}
+
+// newAssetsFS builds the http.FileSystem that serves the Jaeger UI bundle
+// from assetsPath. A directory is served as-is, matching the historical
+// behavior. A .tar.gz or .tgz file is unpacked into memory and served from
+// there instead, so a custom distribution can point assets_path directly at
+// the published assets.tar.gz without unpacking it into the image first.
+func newAssetsFS(assetsPath string) (http.FileSystem, error) {
+	info, err := os.Stat(assetsPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot access assets_path %v: %w", assetsPath, err)
+	}
+	if info.IsDir() {
+		return http.Dir(assetsPath), nil
+	}
+	lower := strings.ToLower(assetsPath)
+	if !strings.HasSuffix(lower, ".tar.gz") && !strings.HasSuffix(lower, ".tgz") {
+		return nil, fmt.Errorf("assets_path %v is a file but not a .tar.gz or .tgz archive", assetsPath)
+	}
+	return archiveAssetsFS(assetsPath)
+}
+
+// archiveAssetsFS unpacks the gzip-compressed tar archive at assetsPath into
+// an in-memory filesystem. Any leading "packages/jaeger-ui/build/" prefix
+// (matching published jaeger-ui release artifacts) is stripped so index.html
+// is served at the root. Entries containing ".." are skipped to prevent directory
+// traversal.
+func archiveAssetsFS(assetsPath string) (http.FileSystem, error) {
+	f, err := os.Open(assetsPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open assets archive %v: %w", assetsPath, err)
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read assets archive %v: %w", assetsPath, err)
+	}
+	defer gzr.Close()
+
+	memFs := afero.NewMemMapFs()
+	tr := tar.NewReader(gzr)
+	fileCount := 0
+
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("cannot read assets archive %v: %w", assetsPath, err)
+		}
+		// Skip entries with directory traversal or non-regular files (directories, symlinks, etc.)
+		if strings.Contains(hdr.Name, "..") || hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+
+		cleanName := strings.TrimPrefix(path.Clean("/"+hdr.Name), "/")
+		cleanName = strings.TrimPrefix(cleanName, jaegerUIArchivePrefix)
+		cleanName = strings.TrimPrefix(cleanName, "/")
+		if cleanName == "" || cleanName == "." {
+			continue
+		}
+
+		if err := memFs.MkdirAll(path.Dir(cleanName), 0o755); err != nil {
+			return nil, fmt.Errorf("cannot create directory in assets archive for %v: %w", cleanName, err)
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read %v from assets archive %v: %w", hdr.Name, assetsPath, err)
+		}
+		if err := afero.WriteFile(memFs, cleanName, data, 0o444); err != nil {
+			return nil, fmt.Errorf("cannot write %v to in-memory filesystem: %w", cleanName, err)
+		}
+		fileCount++
+	}
+
+	if fileCount == 0 {
+		return nil, fmt.Errorf("assets archive %v contains no files", assetsPath)
+	}
+
+	return http.FS(afero.NewIOFS(memFs)), nil
 }
 
 // getUIConfig returns the cached parsed UI config, re-reading it from disk

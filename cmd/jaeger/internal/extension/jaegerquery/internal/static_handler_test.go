@@ -5,7 +5,9 @@
 package app
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -499,4 +502,300 @@ func syncWrite(target *os.File, temp *os.File, data []byte) error {
 		return err
 	}
 	return os.Rename(temp.Name(), target.Name())
+}
+
+func createTarGz(t *testing.T, archivePath string, files map[string][]byte) {
+	t.Helper()
+	f, err := os.Create(archivePath)
+	require.NoError(t, err)
+	defer f.Close()
+
+	gw := gzip.NewWriter(f)
+	defer gw.Close()
+
+	tw := tar.NewWriter(gw)
+	defer tw.Close()
+
+	for name, content := range files {
+		hdr := &tar.Header{
+			Name:     name,
+			Mode:     0o644,
+			Size:     int64(len(content)),
+			Typeflag: tar.TypeReg,
+			ModTime:  time.Now(),
+		}
+		require.NoError(t, tw.WriteHeader(hdr))
+		_, err = tw.Write(content)
+		require.NoError(t, err)
+	}
+}
+
+func TestNewAssetsFS_Directory(t *testing.T) {
+	fs, err := newAssetsFS("fixture")
+	require.NoError(t, err)
+	assert.Equal(t, http.Dir("fixture"), fs)
+}
+
+func TestNewAssetsFS_FlatArchive(t *testing.T) {
+	tempDir := t.TempDir()
+	indexContent := []byte("<html>Flat Archive</html>")
+	assetContent := []byte("some asset")
+
+	for _, ext := range []string{".tar.gz", ".tgz"} {
+		t.Run(ext, func(t *testing.T) {
+			archivePath := filepath.Join(tempDir, "assets"+ext)
+			createTarGz(t, archivePath, map[string][]byte{
+				"index.html":       indexContent,
+				"static/asset.txt": assetContent,
+			})
+
+			fs, err := newAssetsFS(archivePath)
+			require.NoError(t, err)
+
+			f, err := fs.Open("/index.html")
+			require.NoError(t, err)
+			data, err := io.ReadAll(f)
+			require.NoError(t, f.Close())
+			require.NoError(t, err)
+			assert.Equal(t, indexContent, data)
+
+			fAsset, err := fs.Open("/static/asset.txt")
+			require.NoError(t, err)
+			assetData, err := io.ReadAll(fAsset)
+			require.NoError(t, fAsset.Close())
+			require.NoError(t, err)
+			assert.Equal(t, assetContent, assetData)
+		})
+	}
+}
+
+func TestNewAssetsFS_NestedPrefixArchive(t *testing.T) {
+	tempDir := t.TempDir()
+	archivePath := filepath.Join(tempDir, "assets.tar.gz")
+	indexContent := []byte("<html>Nested Prefix</html>")
+	assetContent := []byte("nested asset")
+
+	createTarGz(t, archivePath, map[string][]byte{
+		"packages/jaeger-ui/build/index.html":       indexContent,
+		"packages/jaeger-ui/build/static/asset.txt": assetContent,
+	})
+
+	fs, err := newAssetsFS(archivePath)
+	require.NoError(t, err)
+
+	f, err := fs.Open("/index.html")
+	require.NoError(t, err)
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	require.NoError(t, err)
+	assert.Equal(t, indexContent, data)
+
+	fAsset, err := fs.Open("/static/asset.txt")
+	require.NoError(t, err)
+	defer fAsset.Close()
+	assetData, err := io.ReadAll(fAsset)
+	require.NoError(t, err)
+	assert.Equal(t, assetContent, assetData)
+}
+
+func TestNewAssetsFS_Errors(t *testing.T) {
+	tempDir := t.TempDir()
+
+	t.Run("non-existent file", func(t *testing.T) {
+		_, err := newAssetsFS(filepath.Join(tempDir, "does-not-exist.tar.gz"))
+		require.ErrorContains(t, err, "cannot access assets_path")
+	})
+
+	t.Run("unsupported file extension", func(t *testing.T) {
+		unsupportedFile := filepath.Join(tempDir, "assets.zip")
+		require.NoError(t, os.WriteFile(unsupportedFile, []byte("fake zip"), 0o644))
+		_, err := newAssetsFS(unsupportedFile)
+		require.ErrorContains(t, err, "is a file but not a .tar.gz or .tgz archive")
+	})
+
+	t.Run("corrupted gzip", func(t *testing.T) {
+		corruptedGzip := filepath.Join(tempDir, "corrupted.tar.gz")
+		require.NoError(t, os.WriteFile(corruptedGzip, []byte("not gzip content"), 0o644))
+		_, err := newAssetsFS(corruptedGzip)
+		require.ErrorContains(t, err, "cannot read assets archive")
+	})
+
+	t.Run("corrupted tar header", func(t *testing.T) {
+		corruptedTar := filepath.Join(tempDir, "corrupted-tar.tar.gz")
+		f, err := os.Create(corruptedTar)
+		require.NoError(t, err)
+		gw := gzip.NewWriter(f)
+		_, err = gw.Write(bytes.Repeat([]byte("A"), 512))
+		require.NoError(t, err)
+		require.NoError(t, gw.Close())
+		require.NoError(t, f.Close())
+
+		_, err = newAssetsFS(corruptedTar)
+		require.ErrorContains(t, err, "cannot read assets archive")
+	})
+
+	t.Run("empty archive", func(t *testing.T) {
+		emptyTar := filepath.Join(tempDir, "empty.tar.gz")
+		f, err := os.Create(emptyTar)
+		require.NoError(t, err)
+		gw := gzip.NewWriter(f)
+		tw := tar.NewWriter(gw)
+		require.NoError(t, tw.Close())
+		require.NoError(t, gw.Close())
+		require.NoError(t, f.Close())
+
+		_, err = newAssetsFS(emptyTar)
+		require.ErrorContains(t, err, "contains no files")
+	})
+
+	t.Run("truncated entry body", func(t *testing.T) {
+		var raw bytes.Buffer
+		tw := tar.NewWriter(&raw)
+		require.NoError(t, tw.WriteHeader(&tar.Header{
+			Name: "index.html",
+			Mode: 0o644,
+			Size: 100, // promises 100 bytes that never follow
+		}))
+		headerOnly := raw.Bytes()
+		require.NotEmpty(t, headerOnly)
+
+		truncatedTar := filepath.Join(tempDir, "truncated.tar.gz")
+		f, err := os.Create(truncatedTar)
+		require.NoError(t, err)
+		gw := gzip.NewWriter(f)
+		_, err = gw.Write(headerOnly)
+		require.NoError(t, err)
+		require.NoError(t, gw.Close())
+		require.NoError(t, f.Close())
+
+		_, err = newAssetsFS(truncatedTar)
+		require.ErrorContains(t, err, "cannot read index.html from assets archive")
+	})
+}
+
+func TestNewAssetsFS_PathTraversalAndNonRegularFiles(t *testing.T) {
+	tempDir := t.TempDir()
+	archivePath := filepath.Join(tempDir, "traversal.tar.gz")
+
+	f, err := os.Create(archivePath)
+	require.NoError(t, err)
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+
+	// Add directory entry (should be skipped)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "static",
+		Typeflag: tar.TypeDir,
+		Mode:     0o755,
+	}))
+
+	// Add entry that becomes empty after stripping prefix (should be skipped)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "packages/jaeger-ui/build",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     0,
+	}))
+
+	// Add path traversal entry (should be skipped)
+	secretContent := []byte("top secret")
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "../../etc/passwd",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(secretContent)),
+	}))
+	_, err = tw.Write(secretContent)
+	require.NoError(t, err)
+
+	// Add regular valid file
+	indexContent := []byte("<html>Valid</html>")
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "index.html",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(indexContent)),
+	}))
+	_, err = tw.Write(indexContent)
+	require.NoError(t, err)
+
+	require.NoError(t, tw.Close())
+	require.NoError(t, gw.Close())
+	require.NoError(t, f.Close())
+
+	fs, err := newAssetsFS(archivePath)
+	require.NoError(t, err)
+
+	// Traversal file must not exist
+	_, err = fs.Open("/etc/passwd")
+	require.Error(t, err)
+
+	// Valid file must exist
+	vf, err := fs.Open("/index.html")
+	require.NoError(t, err)
+	defer vf.Close()
+	data, err := io.ReadAll(vf)
+	require.NoError(t, err)
+	assert.Equal(t, indexContent, data)
+}
+
+func TestArchiveAssetsFS_OpenError(t *testing.T) {
+	_, err := archiveAssetsFS(filepath.Join(t.TempDir(), "nonexistent.tar.gz"))
+	require.ErrorContains(t, err, "cannot open assets archive")
+}
+
+func TestRegisterStaticHandler_WithArchive(t *testing.T) {
+	tempDir := t.TempDir()
+	archivePath := filepath.Join(tempDir, "assets.tar.gz")
+
+	indexBytes, err := os.ReadFile("fixture/index.html")
+	require.NoError(t, err)
+	assetBytes, err := os.ReadFile("fixture/static/asset.txt")
+	require.NoError(t, err)
+
+	createTarGz(t, archivePath, map[string][]byte{
+		"packages/jaeger-ui/build/index.html":       indexBytes,
+		"packages/jaeger-ui/build/static/asset.txt": assetBytes,
+	})
+
+	logger, logBuf := testutils.NewLogger()
+	r := http.NewServeMux()
+	closer := RegisterStaticHandler(
+		r, logger, &QueryOptions{
+			UIConfig: UIConfig{
+				AssetsPath: archivePath,
+				LogAccess:  true,
+			},
+			BasePath: "/jaeger",
+		},
+		withCaps(BackendCapabilities{
+			ArchiveStorage: true,
+		}),
+	)
+	defer closer.Close()
+
+	server := httptest.NewServer(r)
+	defer server.Close()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	// 1. Check SPA root
+	resp, err := client.Get(server.URL + "/jaeger/")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), `JAEGER_CONFIG=DEFAULT_CONFIG;`)
+	assert.Contains(t, string(body), `JAEGER_BACKEND_CAPABILITIES = {"archiveStorage":true,"metricsStorage":false,"searchWithoutServiceName":false,"aiAssistant":false};`)
+
+	// 2. Check static asset
+	respAsset, err := client.Get(server.URL + "/jaeger/static/asset.txt")
+	require.NoError(t, err)
+	defer respAsset.Body.Close()
+	require.Equal(t, http.StatusOK, respAsset.StatusCode)
+	assetBody, err := io.ReadAll(respAsset.Body)
+	require.NoError(t, err)
+	assert.Equal(t, assetBytes, assetBody)
+	assert.Contains(t, logBuf.String(), "static/asset.txt")
 }
